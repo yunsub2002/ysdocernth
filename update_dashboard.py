@@ -3,6 +3,7 @@
 VALUE HTS v2 — 매일 추천 스캐너
   python update_dashboard.py          : 4개 시장 전종목 스캔 → 카테고리별 추천 → VALUE_HTS.html 생성·열기
   python update_dashboard.py --live   : 위 작업 + 로컬 서버에서 60초마다 추천 종목 현재가 자동 갱신
+  python update_dashboard.py --pred   : 전종목 선행 예측(pred.json)만 다시 계산
 시장: NASDAQ · NYSE · KOSPI · KOSDAQ (Yahoo Finance 스크리너로 전종목 시세·52주 고저·PER·PBR·시총 수집)
 카테고리: 오늘의 TOP20 / 저PER·저PBR 가치주 / 고점대비 급락 반등 / 52주 저점권 / 주도주 눌림목 / 동전주 10배 후보
 ※ 투자 권유가 아닌 기계적 스크리닝 결과입니다.
@@ -204,7 +205,7 @@ def reasons(cat, r, kr):
 CATW = {'value': 5, 'leader': 5, 'drop': 4, 'low': 3, 'penny': 3}
 
 def build_market(name, M):
-    print(f'\n[{name}] 전종목 스캔...'); rows = scan_market(name, M); print(f'   {len(rows)}종목 수집')
+    print(f'\n[{name}] 전종목 스캔...'); rows = scan_market(name, M); print(f'   {len(rows)}종목 수집'); ROWS[name] = rows
     if M['kr']: print(f'   재무 {kr_fundamentals(rows)}종목 반영')
     C, topcap = prelim(rows, M)
     syms = list(dict.fromkeys(r['sym'] for L in C.values() for r in L)); print(f'   1차 후보 {len(syms)}종목 → 1년 일봉 수신')
@@ -304,6 +305,9 @@ def quotes():
 
 def main():
     if '--quotes' in sys.argv and quotes(): return
+    if '--pred' in sys.argv:   # 선행 예측만 다시 계산 (index.html 은 그대로)
+        B = read_baked() if os.path.exists(OUT) else None
+        build_pred(B['at'] if B else None); return
     only = [a.upper() for a in sys.argv[1:] if a.upper() in MKTS]
     t0 = time.time(); res = {}
     for name, M in MKTS.items():
@@ -312,6 +316,8 @@ def main():
         except Exception as e: print(f'   ! {name} 실패: {e}')
     if not res: sys.exit('[오류] 4개 시장 모두 수집 실패 (Yahoo 일시 차단 가능) → 잠시 후 다시 실행')
     baked = build(res); print(f'총 소요 {time.time()-t0:.0f}초')
+    try: build_pred(baked['at'])   # 선행 예측 (실패해도 추천 스캔 결과는 그대로)
+    except Exception as e: print('   ! 선행 예측 생략:', e)
     json.dump({'at': '', 'scanAt': baked['at'], 'q': {}}, open(LIVE_JSON, 'w', encoding='utf-8'))
     if '--live' in sys.argv:
         import http.server, socketserver
@@ -323,6 +329,207 @@ def main():
         with socketserver.TCPServer(('127.0.0.1', PORT), H) as s: s.serve_forever()
     elif '--nobrowser' not in sys.argv:
         webbrowser.open('file:///' + OUT.replace('\\', '/'))
+
+# =====================================================================
+# ---------- 6) 선행 예측 (전종목) → pred.json ----------
+#   스캔 때 함께 실행. 전종목(유동성 필터) 2년 일봉으로 RSI·스토캐스틱·MACD·볼린저·MFI·OBV·
+#   매수압력·다이버전스·이격도 신호를 만들고, 종목별 과거 적중도로 가중치를 조절한 뒤
+#   '과거 비슷한 신호가 나온 날의 5일·20일 뒤 수익률'로 상승 확률과 예상 범위를 계산한다.
+#   ※ 확률적 추정이며 투자 권유가 아님. 실패해도 기존 추천 스캔에는 영향 없음.
+# =====================================================================
+PRED_JSON = os.path.join(BASE, 'pred.json')
+ROWS = {}   # build_market 이 시장별 전종목 시세를 여기에 남김
+MKCODE = {'KOSPI': 'K', 'KOSDAQ': 'Q', 'NASDAQ': 'N', 'NYSE': 'Y'}
+RULES = [('rsiRev', 'RSI 과매수·과매도', 1.0), ('rsiMom', 'RSI 방향', 0.8), ('stoch', '스토캐스틱', 0.8), ('macd', 'MACD', 1.0),
+         ('trend', '이동평균 정배열', 1.1), ('bb', '볼린저밴드 위치', 0.7), ('flow', '거래량 매수세', 1.0), ('mfi', 'MFI(자금흐름)', 0.8),
+         ('div', 'RSI 다이버전스', 0.7), ('gap', '20일선 이격(되돌림)', 0.8)]
+LVN = ['20일 저점', '20일 고점', '60일 저점', '60일 고점', '20일선', '60일선', '120일선', '볼린저 상단', '볼린저 하단', '52주 고점', '52주 저점']
+
+def _rd(x, kr):
+    if x is None or not math.isfinite(x): return None
+    return round(x) if kr and abs(x) >= 100 else (round(x, 2) if abs(x) >= 1 else round(x, 4))
+
+def pred_engine(df, kr):
+    """df: Open/High/Low/Close/Volume 일봉. 결과 dict 또는 None"""
+    import numpy as np
+    d = df.dropna(subset=['Close'])
+    d = d[d['Close'] > 0]
+    if len(d) < 130: return None
+    c = d['Close'].astype(float); o = d['Open'].fillna(c).astype(float)
+    h = pd.concat([d['High'].fillna(c), o, c], axis=1).max(axis=1); l = pd.concat([d['Low'].fillna(c), o, c], axis=1).min(axis=1)
+    v = d['Volume'].fillna(0).astype(float)
+    n = len(c); C = c.values
+    dl = c.diff()
+    ag = dl.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean(); al = (-dl.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    R = 100 - 100 / (1 + ag / al.replace(0, np.nan)); R = R.fillna(100)
+    hh, ll = h.rolling(14).max(), l.rolling(14).min()
+    K = (100 * (c - ll) / (hh - ll).replace(0, np.nan)).fillna(50).rolling(3).mean(); D = K.rolling(3).mean()
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean(); hist = macd - macd.ewm(span=9, adjust=False).mean()
+    m20, m60, m120 = c.rolling(20).mean(), c.rolling(60).mean(), c.rolling(120).mean(); sd = c.rolling(20).std(ddof=0)
+    pb = ((c - (m20 - 2 * sd)) / (4 * sd).replace(0, np.nan)).fillna(0.5)
+    obv = (np.sign(dl.fillna(0)) * v).cumsum(); ob = ((obv - obv.shift(20)) / v.rolling(20).sum().replace(0, np.nan)).fillna(0)
+    tp = (h + l + c) / 3; mf = tp * v; pos = mf.where(tp > tp.shift(), 0).rolling(14).sum(); neg = mf.where(tp < tp.shift(), 0).rolling(14).sum()
+    mfi = (100 - 100 / (1 + pos / neg.replace(0, np.nan))).fillna(100).where(pos + neg > 0, 50)
+    clv = (((c - l) - (h - c)) / (h - l).replace(0, np.nan)).fillna(0); clv10 = clv.rolling(10).mean()
+    upw = v.where(dl > 0, 0) + 0.5 * v.where(dl == 0, 0); upv = (upw.rolling(10).sum() / v.rolling(10).sum().replace(0, np.nan)).fillna(0.5)
+    ret = np.log(c / c.shift()); sd20 = (ret.rolling(20).std() * 100).fillna(2).clip(lower=0.3)
+    cl = lambda x, a=-1, b=1: x.clip(a, b)
+    S = {}
+    S['rsiRev'] = cl((32 - R) / 14, 0, 1).where(R < 30, 0) - cl((R - 68) / 14, 0, 1).where(R > 70, 0)
+    S['rsiMom'] = cl((R - R.shift(5)) / 15) * np.where((R > 75) | (R < 25), 0.5, 1)
+    s = cl((K - D) / 8); s = s.where(~((K > 85) & (s > 0)), s * 0.4); s = s.where(~((K < 15) & (s < 0)), s * 0.4)
+    s = s.where(~((K < 20) & (K > D)), np.maximum(s, 0.5)); s = s.where(~((K > 80) & (K < D)), np.minimum(s, -0.5)); S['stoch'] = s
+    s = 0.5 * cl(hist / c * 100 / 0.6) + 0.5 * cl((hist - hist.shift(3)) / c * 100 / 0.25)
+    s = s.where(~((hist > 0) & (hist.shift() <= 0)), np.maximum(s, 0.7)); s = s.where(~((hist < 0) & (hist.shift() >= 0)), np.minimum(s, -0.7)); S['macd'] = s
+    S['trend'] = pd.Series(np.where(c > m20, .35, -.35) + np.where(m20 > m60, .3, -.3), index=c.index) + .35 * cl((m20 / m20.shift(5) - 1) * 100 / 1.5)
+    S['bb'] = cl((0.1 - pb) * 5 + 0.3).where(pb < 0.1, 0) - cl((pb - 0.9) * 5 + 0.3).where(pb > 0.9, 0)
+    S['flow'] = cl(0.8 * ob + 0.75 * clv10 + 1.2 * (upv - 0.5))
+    S['mfi'] = pd.Series(np.where(mfi < 20, cl((25 - mfi) / 15 + 0.2), np.where(mfi > 80, -cl((mfi - 75) / 15 + 0.2), 0.5 * cl((mfi - mfi.shift(5)) / 25))), index=c.index)
+    lowR, lowP = l.rolling(10).min(), l.shift(15).rolling(25).min(); hiR, hiP = h.rolling(10).max(), h.shift(15).rolling(25).max()
+    rR, rP, xR, xP = R.rolling(10).min(), R.shift(15).rolling(25).min(), R.rolling(10).max(), R.shift(15).rolling(25).max()
+    S['div'] = pd.Series(np.where((lowR < lowP) & (rR > rP + 3), 0.8, 0) + np.where((hiR > hiP) & (xR < xP - 3), -0.8, 0), index=c.index)
+    S['gap'] = -cl((c / m20 - 1) * 100 / (sd20 * 4))
+    keys = [k for k, _, _ in RULES]; base = np.array([w for _, _, w in RULES])
+    M = np.nan_to_num(np.vstack([S[k].values.astype(float) for k in keys]), nan=0.0)   # (규칙, 날짜)
+    st = 70
+    f5 = np.log(c.shift(-5) / c).values; f20 = np.log(c.shift(-20) / c).values
+    def ics(a, b):
+        out = []
+        for k in range(len(keys)):
+            x, y = M[k, a:b], f5[a:b]; ok = np.isfinite(y)
+            x, y = x[ok], y[ok]
+            out.append(0.0 if len(x) < 30 or x.std() < 1e-9 or y.std() < 1e-12 else float(np.corrcoef(x, y)[0, 1]))
+        return np.nan_to_num(np.array(out))
+    end5 = n - 5
+    ic = ics(st, end5); W = base * np.clip(1 + ic * 6, 0.3, 2.2)
+    comp = (W[:, None] * M).sum(0) / W.sum()
+    # 걸어가며 검증(앞 절반으로 가중치 → 뒤 절반 방향 적중률)
+    oos = [None, 0]
+    mid = (st + end5) // 2
+    if end5 - st >= 120:
+        Wf = base * np.clip(1 + ics(st, mid) * 6, 0.3, 2.2); cf = (Wf[:, None] * M).sum(0) / Wf.sum()
+        x, y = cf[mid:end5], f5[mid:end5]; ok = np.isfinite(y) & (np.abs(x) > 0.1)
+        if ok.sum() >= 15: oos = [round(float((np.sign(x[ok]) == np.sign(y[ok])).mean()) * 100), int(ok.sum())]
+    sdd = float(np.nanstd(ret.values[-60:]))   # 일간 로그수익률 표준편차
+    now = float(comp[-1]); res = {}
+    for hz, F in ((5, f5), (20, f20)):
+        X, Y = comp[st:n - hz], F[st:n - hz]; ok = np.isfinite(Y); X, Y = X[ok], Y[ok]
+        if len(Y) < 30: return None
+        bm, bu = float(Y.mean()), float((Y > 0).mean())
+        wdt = 0.10
+        while True:
+            sel = np.abs(X - now) <= wdt
+            if sel.sum() >= 25 or wdt >= 0.35: break
+            wdt += 0.05
+        Ys = Y[sel]; na = int(len(Ys)); am = float(Ys.mean()) if na else bm; au = float((Ys > 0).mean()) if na else bu
+        kk = 12; sh = sdd * math.sqrt(hz)
+        pu = (na * au + kk * bu) / (na + kk); mu = (na * am + kk * now * 0.25 * sh) / (na + kk)
+        res[hz] = {'pu': min(0.8, max(0.2, pu)), 'mu': mu, 'n': na, 'au': au, 'bu': bu}
+    sent = pd.concat([R, K, mfi, 50 + 50 * clv10, 100 * upv, 50 + 50 * cl(ob * 2)], axis=1).mean(axis=1).clip(0, 100)
+    i = n - 1; p = float(C[i])
+    lv = []
+    def add(x, k):
+        if x is not None and math.isfinite(x) and x > 0: lv.append((float(x), k))
+    add(l.iloc[-20:].min(), 0); add(h.iloc[-20:].max(), 1); add(l.iloc[-60:].min(), 2); add(h.iloc[-60:].max(), 3)
+    add(m20.iloc[i], 4); add(m60.iloc[i], 5); add(m120.iloc[i], 6); add((m20 + 2 * sd).iloc[i], 7); add((m20 - 2 * sd).iloc[i], 8)
+    add(h.iloc[-250:].max(), 9); add(l.iloc[-250:].min(), 10)
+    sup = sorted([x for x in lv if x[0] < p * 0.998], key=lambda x: -x[0])[:3]; rs = sorted([x for x in lv if x[0] > p * 1.002], key=lambda x: x[0])[:3]
+    f = lambda x, dd=1: None if x is None or not math.isfinite(float(x)) else round(float(x), dd)
+    ma = (1 if p > m20.iloc[i] else 0) + (1 if m20.iloc[i] > m60.iloc[i] else 0) + (1 if m60.iloc[i] > (m120.iloc[i] if math.isfinite(m120.iloc[i]) else -1) else 0)
+    va = v.iloc[-60:].mean()
+    return {
+        't': c.index[-1].strftime('%Y-%m-%d'), 'p': _rd(p, kr), 'ch': f((C[i] / C[i - 1] - 1) * 100, 2),
+        's': round(now * 100), 'se': round(float(sent.iloc[i])), 'sh': [round(float(x)) for x in sent.iloc[-40:].fillna(50)],
+        'pu': [round(res[5]['pu'] * 100), round(res[20]['pu'] * 100)], 'mu': [f(res[5]['mu'] * 100, 2), f(res[20]['mu'] * 100, 2)],
+        'sd': f(sdd * 100, 2), 'an': [res[5]['n'], res[20]['n']], 'au': [round(res[5]['au'] * 100), round(res[20]['au'] * 100)],
+        'bu': [round(res[5]['bu'] * 100), round(res[20]['bu'] * 100)], 'oos': oos,
+        'sg': [round(float(M[k, i]) * 100) for k in range(len(keys))], 'ic': [round(float(x) * 100) for x in ic], 'w': [round(float(x) * 10) for x in W],
+        'iv': {'rsi': f(R.iloc[i]), 'rsi5': f(R.iloc[i - 5]), 'k': f(K.iloc[i]), 'd': f(D.iloc[i]), 'mfi': f(mfi.iloc[i]), 'hn': f(hist.iloc[i] / p * 100, 2),
+               'pb': f(pb.iloc[i], 2), 'g20': f((p / m20.iloc[i] - 1) * 100), 'g60': f((p / m60.iloc[i] - 1) * 100), 'ob': f(ob.iloc[i], 2),
+               'clv': f(clv10.iloc[i], 2), 'upv': f(upv.iloc[i] * 100, 0), 'vr': f(v.iloc[-5:].mean() / va if va else 1, 2), 'ma': ma,
+               'r20': f((C[i] / C[i - 20] - 1) * 100), 'r5': f((C[i] / C[i - 5] - 1) * 100)},
+        'lv': {'s': [[_rd(x, kr), k] for x, k in sup], 'r': [[_rd(x, kr), k] for x, k in rs]},
+        'cl': [_rd(float(x), kr) for x in C[-60:]], 'av': round(float(v.iloc[-20:].mean())),
+    }
+
+def naver_names():
+    """한국 전종목 한글 이름 (네이버 시가총액 목록). 실패하면 빈 dict"""
+    out = {}
+    for mk in ('KOSPI', 'KOSDAQ'):
+        for pg in range(1, 40):
+            try:
+                j = json.loads(urllib.request.urlopen(urllib.request.Request(f'https://m.stock.naver.com/api/stocks/marketValue/{mk}?page={pg}&pageSize=100', headers=UA), timeout=8).read().decode('utf-8'))
+            except Exception:
+                return out
+            st = j.get('stocks') or []
+            for s_ in st: out[s_.get('itemCode')] = s_.get('stockName')
+            if len(st) < 100: break
+    return out
+
+def naver_flow(code):
+    j = json.loads(urllib.request.urlopen(urllib.request.Request(f'https://m.stock.naver.com/api/stock/{code}/trend?pageSize=20', headers=UA), timeout=6).read().decode('utf-8'))
+    g = lambda x: num(str(x or '0').replace(',', '').replace('+', '').replace('%', '')) or 0
+    L = [(g(x.get('foreignerPureBuyQuant')), g(x.get('organPureBuyQuant')), g(x.get('individualPureBuyQuant'))) for x in (j or [])]
+    if not L: return None
+    sm = lambda a, b: [round(sum(x[k] for x in L[a:b])) for k in range(3)]
+    return {'d5': sm(0, 5), 'd20': sm(0, 20), 'fr': num(str((j or [{}])[0].get('foreignerHoldRatio', '')).replace('%', '')),
+            'days': [[x.get('bizdate'), g(x.get('foreignerPureBuyQuant')), g(x.get('organPureBuyQuant'))] for x in j[:10]]}
+
+def build_pred(scan_at=None):
+    t0 = time.time()
+    if not ROWS:
+        for name, M in MKTS.items():
+            try: ROWS[name] = scan_market(name, M); print(f'   [예측] {name} {len(ROWS[name])}종목 시세')
+            except Exception as e: print(f'   [예측] {name} 시세 실패 {e}')
+    uni = []
+    for name, rows in ROWS.items():
+        M = MKTS[name]
+        if M['kr']: L = [r for r in rows if r['cap'] >= 3e10 and r['val'] >= 2e8]
+        else: L = [r for r in rows if r['cap'] >= 3e8 and r['val'] >= 2e6]
+        uni += L; print(f'   [예측] {name} 대상 {len(L)}종목')
+    kn = naver_names(); print(f'   [예측] 한글 종목명 {len(kn)}개')
+    out = {}; done = 0
+    for kr in (True, False):
+        U = [r for r in uni if MKTS[r['mkt']]['kr'] == kr]
+        for k in range(0, len(U), 150):
+            chunk = U[k:k + 150]; syms = [r['sym'] for r in chunk]
+            df = None
+            for t in range(3):
+                try: df = yf.download(syms, period='2y', interval='1d', group_by='ticker', auto_adjust=False, threads=True, progress=False); break
+                except Exception as e: print('   ! 예측 일봉 실패', e); time.sleep(3)
+            if df is None: continue
+            for r in chunk:
+                try:
+                    d = df[r['sym']] if isinstance(df.columns, pd.MultiIndex) else df
+                    e = pred_engine(d, kr)
+                    if not e: continue
+                    e['m'] = MKCODE[r['mkt']]; e['n'] = kn.get(r['code']) or r.get('kname') or r['name']
+                    e['cap'] = round(r['cap'] / (1e8 if kr else 1e6)); e['pe'] = _rd(r.get('pe'), False) if r.get('pe') and r['pe'] > 0 else None
+                    out[r['code']] = e; done += 1
+                except Exception: pass
+            print(f'   [예측] {"국내" if kr else "미국"} {min(k + 150, len(U))}/{len(U)} · 누적 {done}종목 ({time.time() - t0:.0f}초)')
+    # 국내 외국인·기관 수급 (거래대금 상위 500종목)
+    try:
+        krc = sorted([r for r in uni if MKTS[r['mkt']]['kr'] and r['code'] in out], key=lambda r: -r['val'])[:500]
+        naver_flow(krc[0]['code'])
+        from concurrent.futures import ThreadPoolExecutor
+        def job(r):
+            try: return r['code'], naver_flow(r['code'])
+            except Exception: return r['code'], None
+        nf = 0
+        with ThreadPoolExecutor(8) as ex:
+            for code, fl in ex.map(job, krc):
+                if fl:
+                    e = out[code]; fl['av'] = e['av']; e['fl'] = fl; nf += 1
+                    fs = max(-1, min(1, (fl['d5'][0] + fl['d5'][1]) / (e['av'] * 5 or 1) * 8))   # 외국인+기관 5일 순매수 / 5일 거래량
+                    sh = (e['sd'] or 2) / 100 * math.sqrt(5)
+                    e['pu'][0] = max(20, min(80, round(e['pu'][0] + 4 * fs))); e['pu'][1] = max(20, min(80, round(e['pu'][1] + 3 * fs)))
+                    e['mu'][0] = round(e['mu'][0] + fs * 0.1 * sh * 100, 2); e['fs'] = round(fs * 100)
+        print(f'   [예측] 수급 {nf}종목 반영')
+    except Exception as e: print('   [예측] 수급 생략', e)
+    P = {'at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), 'scanAt': scan_at, 'rules': [[k, nm] for k, nm, _ in RULES], 'lvn': LVN, 'n': len(out), 's': out}
+    json.dump(P, open(PRED_JSON, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
+    print(f'예측 완료: {len(out)}종목 → pred.json ({os.path.getsize(PRED_JSON) / 1e6:.1f} MB, {time.time() - t0:.0f}초)')
 
 if __name__ == '__main__':
     main()
