@@ -3,7 +3,8 @@
 VALUE HTS v2 — 매일 추천 스캐너
   python update_dashboard.py          : 4개 시장 전종목 스캔 → 카테고리별 추천 → VALUE_HTS.html 생성·열기
   python update_dashboard.py --live   : 위 작업 + 로컬 서버에서 60초마다 추천 종목 현재가 자동 갱신
-  python update_dashboard.py --pred   : 전종목 선행 예측(pred.json)만 다시 계산
+  python update_dashboard.py --pred   : 전종목 선행 예측(pred.json) 계산 → 예측 기반 추천(🔮 선행예측 TOP20 등)을 index.html 에 반영
+  python update_dashboard.py --nopred : 가치·반등 추천 스캔만 (GitHub Actions 는 스캔 → 예측을 단계별로 따로 실행)
 시장: NASDAQ · NYSE · KOSPI · KOSDAQ (Yahoo Finance 스크리너로 전종목 시세·52주 고저·PER·PBR·시총 수집)
 카테고리: 오늘의 TOP20 / 저PER·저PBR 가치주 / 고점대비 급락 반등 / 52주 저점권 / 주도주 눌림목 / 동전주 10배 후보
 ※ 투자 권유가 아닌 기계적 스크리닝 결과입니다.
@@ -26,7 +27,7 @@ MKTS = {'NASDAQ': {'ex': ['NMS', 'NGM', 'NCM'], 'kr': False, 'minCap': 3e8, 'min
         'NYSE':   {'ex': ['NYQ'], 'kr': False, 'minCap': 3e8, 'minVal': 3e6, 'penny': (0.3, 5.0), 'pennyCap': 3e7, 'pennyVal': 1e6},
         'KOSPI':  {'ex': ['KSC'], 'kr': True, 'minCap': 5e10, 'minVal': 5e8, 'penny': (300, 2000), 'pennyCap': 1.5e10, 'pennyVal': 3e8},
         'KOSDAQ': {'ex': ['KOE'], 'kr': True, 'minCap': 5e10, 'minVal': 5e8, 'penny': (300, 2000), 'pennyCap': 1.5e10, 'pennyVal': 3e8}}
-CATS = [('top', '오늘의 TOP20'), ('value', '저PER·저PBR 가치주'), ('drop', '고점대비 급락 반등'), ('low', '52주 저점권'), ('leader', '주도주 눌림목'), ('penny', '동전주 10배 후보')]
+CATS = [('top', '가치 스캔 TOP20'), ('value', '저PER·저PBR 가치주'), ('drop', '고점대비 급락 반등'), ('low', '52주 저점권'), ('leader', '주도주 눌림목'), ('penny', '동전주 10배 후보')]
 def num(v):
     try:
         v = float(v); return None if math.isnan(v) or math.isinf(v) else v
@@ -263,10 +264,16 @@ def build(all_):
     baked = {'at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), 'cats': CATS, 'picks': {}, 'info': {}, 'bars': {}, 'fund': {}, 'watch': [], 'src': 'Yahoo Finance 스크리너(전종목) · 한국 재무 네이버 금융'}
     for name, (picks, info, bars, fund, watch) in all_.items():
         baked['picks'][name] = picks; baked['info'].update(info); baked['bars'].update(bars); baked['fund'].update(fund); baked['watch'] += watch
+    try:   # 직전 선행예측 추천을 이어 붙임 (스캔만 다시 돌아도 첫 화면 예측 추천이 사라지지 않게)
+        old = read_baked()
+        if old and old.get('pat'): baked = merge_pred_into(baked, old)
+    except Exception as e: print('   ! 이전 예측 추천 유지 실패', e)
+    write_baked(baked); return baked
+def write_baked(baked):
+    t = open(TEMPLATE, encoding='utf-8').read()
     js = json.dumps(baked, ensure_ascii=False, separators=(',', ':')).replace('</', '<\\/')
     a, b = '/*@BAKED*/', '/*@/BAKED*/'; i, j = t.index(a) + len(a), t.index(b)
     open(OUT, 'w', encoding='utf-8').write(t[:i] + js + t[j:]); print(f'\n생성 완료: {OUT} ({os.path.getsize(OUT)/1e6:.1f} MB)')
-    return baked
 
 def live_loop(watch):
     syms = [w['ysym'] for w in watch]
@@ -316,6 +323,7 @@ def main():
         except Exception as e: print(f'   ! {name} 실패: {e}')
     if not res: sys.exit('[오류] 4개 시장 모두 수집 실패 (Yahoo 일시 차단 가능) → 잠시 후 다시 실행')
     baked = build(res); print(f'총 소요 {time.time()-t0:.0f}초')
+    if '--nopred' in sys.argv: return
     try: build_pred(baked['at'])   # 선행 예측 (실패해도 추천 스캔 결과는 그대로)
     except Exception as e: print('   ! 선행 예측 생략:', e)
     json.dump({'at': '', 'scanAt': baked['at'], 'q': {}}, open(LIVE_JSON, 'w', encoding='utf-8'))
@@ -488,16 +496,22 @@ def build_pred(scan_at=None):
         else: L = [r for r in rows if r['cap'] >= 3e8 and r['val'] >= 2e6]
         uni += L; print(f'   [예측] {name} 대상 {len(L)}종목')
     kn = naver_names(); print(f'   [예측] 한글 종목명 {len(kn)}개')
-    out = {}; done = 0
+    out = {}; done = 0; budget = float(os.environ.get('PRED_BUDGET', '2700'))   # 일봉 수신 시간 예산(초). 넘으면 여기까지 결과로 저장
+    PFRAME.clear(); PROW.clear(); stop = False
+    # 시총 큰 종목부터 → 시간이 모자라도 중요한 종목은 먼저 계산됨
     for kr in (True, False):
-        U = [r for r in uni if MKTS[r['mkt']]['kr'] == kr]
-        for k in range(0, len(U), 150):
-            chunk = U[k:k + 150]; syms = [r['sym'] for r in chunk]
+        U = sorted([r for r in uni if MKTS[r['mkt']]['kr'] == kr], key=lambda r: -r['cap'])
+        for k in range(0, len(U), 120):
+            if time.time() - t0 > budget: print(f'   [예측] 시간 예산 {budget:.0f}초 도달 → 여기까지 저장'); stop = True; break
+            chunk = U[k:k + 120]; syms = [r['sym'] for r in chunk]
             df = None
             for t in range(3):
-                try: df = yf.download(syms, period='2y', interval='1d', group_by='ticker', auto_adjust=False, threads=True, progress=False); break
-                except Exception as e: print('   ! 예측 일봉 실패', e); time.sleep(3)
-            if df is None: continue
+                try:
+                    df = yf.download(syms, period='2y', interval='1d', group_by='ticker', auto_adjust=False, threads=True, progress=False)
+                    if df is not None and len(df): break
+                except Exception as e: print('   ! 예측 일봉 실패', e)
+                time.sleep(5 * (t + 1))
+            if df is None or not len(df): continue
             for r in chunk:
                 try:
                     d = df[r['sym']] if isinstance(df.columns, pd.MultiIndex) else df
@@ -506,8 +520,11 @@ def build_pred(scan_at=None):
                     e['m'] = MKCODE[r['mkt']]; e['n'] = kn.get(r['code']) or r.get('kname') or r['name']
                     e['cap'] = round(r['cap'] / (1e8 if kr else 1e6)); e['pe'] = _rd(r.get('pe'), False) if r.get('pe') and r['pe'] > 0 else None
                     out[r['code']] = e; done += 1
+                    PFRAME[r['code']] = d.dropna(subset=['Close']).tail(260).copy(); PROW[r['code']] = r
                 except Exception: pass
-            print(f'   [예측] {"국내" if kr else "미국"} {min(k + 150, len(U))}/{len(U)} · 누적 {done}종목 ({time.time() - t0:.0f}초)')
+            print(f'   [예측] {"국내" if kr else "미국"} {min(k + 120, len(U))}/{len(U)} · 누적 {done}종목 ({time.time() - t0:.0f}초)')
+            time.sleep(0.5)
+        if stop: break
     # 국내 외국인·기관 수급 (거래대금 상위 500종목)
     try:
         krc = sorted([r for r in uni if MKTS[r['mkt']]['kr'] and r['code'] in out], key=lambda r: -r['val'])[:500]
@@ -527,9 +544,144 @@ def build_pred(scan_at=None):
                     e['mu'][0] = round(e['mu'][0] + fs * 0.1 * sh * 100, 2); e['fs'] = round(fs * 100)
         print(f'   [예측] 수급 {nf}종목 반영')
     except Exception as e: print('   [예측] 수급 생략', e)
-    P = {'at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), 'scanAt': scan_at, 'rules': [[k, nm] for k, nm, _ in RULES], 'lvn': LVN, 'n': len(out), 's': out}
+    if not out: sys.exit('[오류] 예측 0종목 (Yahoo 일시 차단 가능) → 기존 pred.json 유지')
+    P = {'at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), 'scanAt': scan_at, 'rules': [[k, nm] for k, nm, _ in RULES], 'lvn': LVN, 'n': len(out), 'part': stop, 's': out}
+    for e in out.values(): e['ps'] = pred_score(e)   # 예측 추천 점수 (화면 랭킹에서도 사용)
     json.dump(P, open(PRED_JSON, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     print(f'예측 완료: {len(out)}종목 → pred.json ({os.path.getsize(PRED_JSON) / 1e6:.1f} MB, {time.time() - t0:.0f}초)')
+    try: bake_pred_picks(P)
+    except Exception as e: print('   ! 예측 기반 추천 반영 실패', e)
+
+# =====================================================================
+# 7) 선행예측 기반 추천 → index.html 첫 화면 (🔮 선행예측 TOP20 · 1주 · 1개월 · 수급 · 바닥반전)
+#    점수 = 상승확률(1주·1개월) + '평소보다 얼마나 높은가'(엣지) + 예상수익/변동성 + 검증 적중률 + 국내 수급
+# =====================================================================
+PFRAME, PROW = {}, {}
+PCATS = [('ptop', '🔮 선행예측 TOP20'), ('p5', '🔮 1주 상승 예상'), ('p20', '🔮 1개월 상승 예상'), ('pflow', '🔮 수급+상승신호'), ('prev', '🔮 바닥 반전 예상')]
+PKEYS = [k for k, _ in PCATS]
+def pred_score(e):
+    pu5, pu20 = e['pu']; bu5, bu20 = e.get('bu') or [50, 50]; mu5, mu20 = [x or 0 for x in e['mu']]
+    sd = max(e.get('sd') or 2, 0.5); z5 = mu5 / (sd * math.sqrt(5)); z20 = mu20 / (sd * math.sqrt(20))
+    oos = e.get('oos') or [None, 0]; hit = (oos[0] - 50) if oos[0] is not None and (oos[1] or 0) >= 30 else 0
+    s = (pu5 - 50) * 1.0 + (pu20 - 50) * 0.6 + (pu5 - bu5) * 0.8 + (pu20 - bu20) * 0.5 + clamp(z5, -1.5, 1.5) * 8 + clamp(z20, -1.5, 1.5) * 5 + clamp(hit, -15, 15) * 0.4
+    if e.get('fs') is not None: s += clamp(e['fs'] / 100, -1, 1) * 4
+    return round(s, 1)
+def pred_ok(e, tmax):
+    iv = e.get('iv') or {}; oos = e.get('oos') or [None, 0]
+    if e['t'] < tmax: return False                              # 거래정지·데이터 지연 종목 제외
+    if min(e.get('an') or [0]) < 20: return False               # 유사 신호 표본 부족
+    if oos[0] is not None and (oos[1] or 0) >= 30 and oos[0] < 50: return False   # 이 종목에선 과거 검증에서 신호가 50%도 안 맞음
+    if (iv.get('rsi') or 50) > 78 or (e.get('sd') or 0) > 9: return False          # 단기 과열·초고변동
+    return True
+def pred_reason(e):
+    pu, bu, mu = e['pu'], e.get('bu') or [None, None], e['mu']; iv = e.get('iv') or {}; oos = e.get('oos') or [None, 0]
+    R = [f"1주 상승확률 {pu[0]}%" + (f" (평소 {bu[0]}%)" if bu[0] is not None else ''), f"1주 예상 {mu[0]:+.1f}%" if mu[0] is not None else '1주 예상 -',
+         f"1개월 상승확률 {pu[1]}%", f"1개월 예상 {mu[1]:+.1f}%" if mu[1] is not None else '1개월 예상 -']
+    if oos[0] is not None: R.append(f"검증 적중률 {oos[0]}%")
+    if iv.get('rsi') is not None: R.append(f"RSI {iv['rsi']:.0f}")
+    R.append(f"매수심리 {e.get('se')}")
+    if e.get('fl') and (e['fl']['d5'][0] + e['fl']['d5'][1]) > 0: R.append('외국인·기관 5일 순매수')
+    risk = []
+    if (iv.get('rsi') or 50) > 70: risk.append('단기 과열(RSI 70↑)')
+    if (e.get('sd') or 0) >= 5: risk.append(f"고변동성(일 {e['sd']:.1f}%)")
+    if oos[0] is None or (oos[1] or 0) < 30: risk.append('검증 표본 적음')
+    elif oos[0] < 52: risk.append('적중률 50% 근처')
+    if e.get('pe') is None and e['m'] in ('N', 'Y'): risk.append('적자 또는 PER 없음')
+    return R, risk
+def _bars_of(code, kr):
+    d = PFRAME.get(code)
+    if d is None: return None
+    bars = []; rd = (lambda x: round(x)) if kr else (lambda x: round(x, 4 if x < 1 else 2))
+    for ts, r in d.iterrows():
+        c = num(r['Close'])
+        if c is None: continue
+        o = num(r['Open']) or c; h = max(num(r['High']) or c, o, c); l = min(num(r['Low']) or c, o, c)
+        t = int(datetime.datetime(ts.year, ts.month, ts.day, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+        bars.append([t, rd(o), rd(h), rd(l), rd(c), int(num(r['Volume']) or 0)])
+    return bars if len(bars) >= 60 else None
+def pred_lists(P):
+    S_ = P['s']; tmax = {}
+    for e in S_.values(): tmax[e['m']] = max(tmax.get(e['m'], ''), e['t'])
+    res = {}
+    for name in MKTS:
+        mc = MKCODE[name]; L = [(c, e) for c, e in S_.items() if e['m'] == mc and pred_ok(e, tmax[mc]) and c in PFRAME] if mc in tmax else []
+        sc = lambda e: e.get('ps', pred_score(e))
+        up = [(c, e) for c, e in L if e['pu'][0] >= 55 and (e['mu'][0] or 0) > 0 and e['pu'][1] >= 50]
+        R = {}
+        R['ptop'] = [c for c, e in sorted(up, key=lambda x: -sc(x[1]))[:NPICK]]
+        R['p5'] = [c for c, e in sorted(up, key=lambda x: (-x[1]['pu'][0], -(x[1]['mu'][0] or 0)))[:NPICK]]
+        R['p20'] = [c for c, e in sorted([x for x in L if x[1]['pu'][1] >= 58 and (x[1]['mu'][1] or 0) > 0], key=lambda x: (-x[1]['pu'][1], -(x[1]['mu'][1] or 0)))[:NPICK]]
+        R['pflow'] = [c for c, e in sorted([x for x in L if x[1].get('fl') and (x[1]['fl']['d5'][0] + x[1]['fl']['d5'][1]) > 0 and (x[1].get('fs') or 0) > 0 and x[1]['pu'][0] >= 53], key=lambda x: -sc(x[1]))[:NPICK]] if MKTS[name]['kr'] else []
+        R['prev'] = [c for c, e in sorted([x for x in L if (x[1]['iv'].get('rsi') or 50) < 38 and x[1]['pu'][0] >= 55 and (x[1]['mu'][0] or 0) > 0], key=lambda x: -sc(x[1]))[:NPICK]]
+        res[name] = R
+    return res
+def merge_pred_into(baked, old):
+    """old(직전 index.html) 의 선행예측 추천을 새 스캔 결과(baked)에 옮겨 붙임"""
+    for name, P_ in old.get('picks', {}).items():
+        for k in PKEYS:
+            if k in P_: baked['picks'].setdefault(name, {})[k] = P_[k]
+    codes = set(c for P_ in old.get('picks', {}).values() for k in PKEYS for c in P_.get(k, []))
+    have = set(w['code'] for w in baked['watch'])
+    for c in codes:
+        oi = old['info'].get(c)
+        if not oi: continue
+        e = baked['info'].setdefault(c, {'cats': [], 'score': {}, 'reason': [], 'risk': []})
+        e['cats'] = [k for k in oi['cats'] if k in PKEYS] + [k for k in e['cats'] if k not in PKEYS]
+        e['score'].update({k: v for k, v in oi['score'].items() if k in PKEYS})
+        if oi.get('pr'): e['pr'] = oi['pr']; e['reason'] = oi.get('preason', e['reason']); e['preason'] = oi.get('preason'); e['prisk'] = oi.get('prisk', [])
+        if not e.get('m'): e['m'] = oi.get('m', {})
+        if c not in baked['bars'] and c in old.get('bars', {}): baked['bars'][c] = old['bars'][c]
+        if c not in baked['fund'] and c in old.get('fund', {}): baked['fund'][c] = old['fund'][c]
+        if c not in have:
+            w = next((w for w in old['watch'] if w['code'] == c), None)
+            if w: baked['watch'].append(w); have.add(c)
+    baked['cats'] = PCATS + [c for c in baked['cats'] if c[0] not in PKEYS]
+    baked['pat'] = old['pat']
+    return baked
+def bake_pred_picks(P):
+    B = read_baked() if os.path.exists(OUT) else None
+    if not B: B = {'at': P['at'], 'cats': list(CATS), 'picks': {}, 'info': {}, 'bars': {}, 'fund': {}, 'watch': [], 'src': 'Yahoo Finance · 네이버 금융'}
+    # 이전 예측 카테고리 제거
+    for name in B['picks']:
+        for k in PKEYS: B['picks'][name].pop(k, None)
+    for c, I in list(B['info'].items()):
+        I['cats'] = [k for k in I['cats'] if k not in PKEYS]
+        for k in PKEYS: I['score'].pop(k, None)
+        for k in ('pr', 'preason', 'prisk'): I.pop(k, None)
+        if not I['cats']: B['info'].pop(c)
+    keep = set(c for P_ in B['picks'].values() for L in P_.values() for c in L)
+    B['watch'] = [w for w in B['watch'] if w['code'] in keep]; B['bars'] = {c: v for c, v in B['bars'].items() if c in keep}; B['fund'] = {c: v for c, v in B['fund'].items() if c in keep}
+    have = set(w['code'] for w in B['watch'])
+    lists = pred_lists(P); n = 0
+    for name, R in lists.items():
+        B['picks'].setdefault(name, {}).update(R); kr = MKTS[name]['kr']
+        for k, L in R.items():
+            for c in L:
+                e = P['s'][c]; r = PROW[c]; iv = e.get('iv') or {}
+                if c not in B['bars']:
+                    bars = _bars_of(c, kr)
+                    if not bars: continue
+                    B['bars'][c] = bars
+                I = B['info'].setdefault(c, {'cats': [], 'score': {}, 'reason': [], 'risk': []})
+                if k not in I['cats']: I['cats'].insert(len([x for x in I['cats'] if x in PKEYS]), k)
+                I['score'][k] = e.get('ps', pred_score(e))
+                R_, risk = pred_reason(e); I['preason'] = R_; I['prisk'] = risk; I['reason'] = R_ + [x for x in I['reason'] if x not in R_][:3]; I['risk'] = list(dict.fromkeys(risk + I['risk']))
+                I['pr'] = {'pu': e['pu'], 'bu': e.get('bu'), 'mu': e['mu'], 'oos': e.get('oos'), 'se': e.get('se'), 'fs': e.get('fs'), 'sd': e.get('sd'), 't': e['t']}
+                if not I.get('m'):
+                    b = B['bars'][c]; p = b[-1][4]; hi = max(x[2] for x in b[-250:]); lo = min(x[3] for x in b[-250:]); lo60 = min(x[3] for x in b[-60:])
+                    I['m'] = {'dd': round((p / hi - 1) * 100, 2), 'fl': round((p / lo - 1) * 100, 2), 'rsi': iv.get('rsi'), 'ch52': round((p / b[0][4] - 1) * 100, 2) if b[0][4] else None,
+                              'volx5': iv.get('vr'), 'bounce': round((p / lo60 - 1) * 100, 2), 'ret20': iv.get('r20'), 'ma60gap': iv.get('g60'), 'hi': hi, 'lo': lo, 'val': round(r.get('val') or 0)}
+                if c not in B['fund']:
+                    B['fund'][c] = {'per': r.get('pe') if (r.get('pe') or 0) > 0 else None, 'pbr': r.get('pb'), 'roe': None, 'div': r.get('div'), 'debt': None, 'opm': None, 'mcap': r['cap'], 'src': 'Yahoo/네이버'}
+                if c not in have:
+                    B['watch'].append({'code': c, 'name': e['n'], 'mkt': name, 'api': r['sym'], 'ysym': r['sym']}); have.add(c)
+                n += 1
+        # 화면에서 빈 목록이 생기지 않도록 실제로 차트 데이터가 있는 종목만 남김
+        for k in R: B['picks'][name][k] = [c for c in R[k] if c in B['bars']]
+    CL_ = dict(CATS); B['cats'] = PCATS + [[c[0], CL_.get(c[0], c[1])] for c in B.get('cats', CATS) if c[0] not in PKEYS]
+    B['pat'] = P['at']; B.setdefault('scanAt', B.get('at')); B['at'] = P['at']   # 화면 상단 '기준' 시각 = 예측 계산 시각
+    write_baked(B)
+    print('   [예측 추천] ' + ' · '.join(f"{nm} {len(R['ptop'])}" for nm, R in lists.items()) + f' (TOP20) → index.html 첫 화면')
 
 if __name__ == '__main__':
     main()
