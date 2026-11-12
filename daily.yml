@@ -3,17 +3,17 @@ name: VALUE HTS 업데이트
 on:
   schedule:
     # GitHub cron은 UTC 기준 (한국시간 = UTC+9). GitHub 사정으로 수~수십 분 늦게 시작될 수 있음
-    - cron: '17 22 * * 0-4'       # 월~금 07:17 KST  추천종목 전체 재스캔 (미국장 마감 후)
-    - cron: '47 7 * * 1-5'        # 월~금 16:47 KST  추천종목 전체 재스캔 (한국장 마감 후)
+    - cron: '17 22 * * 0-4'       # 월~금 07:17 KST  추천 스캔 + 선행예측 (미국장 마감 후)
+    - cron: '47 7 * * 1-5'        # 월~금 16:47 KST  추천 스캔 + 선행예측 (한국장 마감 후)
     - cron: '*/15 0-6 * * 1-5'    # 한국장 중 15분마다 추천종목 현재가
     - cron: '*/15 13-21 * * 1-5'  # 미국장 중 15분마다 추천종목 현재가
   workflow_dispatch:              # 화면의 '⟳ 추천 다시 뽑기' → Run workflow
     inputs:
       mode:
-        description: 'scan = 추천종목 새로 뽑기(10분) / quotes = 현재가만(1분)'
+        description: 'scan = 추천 스캔 + 선행예측(약 40~60분) / pred = 선행예측만(약 30~45분) / quotes = 현재가만(1분)'
         type: choice
-        options: [scan, quotes]
-        default: scan
+        options: [scan, pred, quotes]
+        default: pred
 
 permissions:
   contents: write
@@ -26,7 +26,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 110          # 예전 60분 → 스캔+예측이 함께 돌면 시간 초과로 통째로 실패하던 문제 수정
     env:
       TZ: Asia/Seoul
     steps:
@@ -39,24 +39,63 @@ jobs:
       - name: 패키지 설치
         run: pip install -r requirements.txt
 
-      - name: 추천종목 스캔 또는 현재가 갱신
+      - name: 실행 모드 결정
+        id: m
         run: |
           S="${{ github.event.schedule }}"; M="${{ github.event.inputs.mode }}"
-          if [ "$M" = "scan" ] || [ "$S" = "17 22 * * 0-4" ] || [ "$S" = "47 7 * * 1-5" ]; then
-            python update_dashboard.py --nobrowser
-          else
-            python update_dashboard.py --quotes --nobrowser
-          fi
-
-      - name: 결과 저장 (index.html · live.json)
-        run: |
+          if [ -n "$M" ]; then MODE="$M"
+          elif [ "$S" = "17 22 * * 0-4" ] || [ "$S" = "47 7 * * 1-5" ]; then MODE=scan
+          else MODE=quotes; fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"; echo "실행 모드: $MODE"
+          # 커밋·푸시 공통 함수 (다른 실행과 겹쳐도 3번 재시도)
+          cat > /tmp/save.sh <<'EOS'
+          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add index.html live.json
-          git commit -m "update $(date '+%Y-%m-%d %H:%M KST')" || { echo "변경 없음"; exit 0; }
-          for i in 1 2 3; do git pull --rebase -X theirs && git push && break; sleep 5; done
+          for f in "$@"; do [ -f "$f" ] && git add "$f"; done
+          git commit -m "$MSG $(date '+%Y-%m-%d %H:%M KST')" || { echo "변경 없음"; exit 0; }
+          for i in 1 2 3; do git pull --rebase -X theirs && git push && exit 0; sleep 7; done
+          exit 1
+          EOS
+
+      # ① 가치·반등 추천 스캔 (예측은 다음 단계에서 따로) — 실패해도 ②는 계속
+      - name: ① 추천 스캔 (가치·반등)
+        if: steps.m.outputs.mode == 'scan'
+        timeout-minutes: 40
+        continue-on-error: true
+        run: python update_dashboard.py --nopred --nobrowser
+
+      - name: ① 스캔 결과 저장
+        if: steps.m.outputs.mode == 'scan'
+        env: { MSG: "scan" }
+        run: bash /tmp/save.sh index.html live.json
+
+      # ② 전종목 선행예측 → pred.json + 첫 화면 '🔮 선행예측 TOP20' 추천 반영
+      - name: ② 선행예측 (전종목) + 예측 기반 추천
+        if: steps.m.outputs.mode == 'scan' || steps.m.outputs.mode == 'pred'
+        timeout-minutes: 60
+        continue-on-error: true
+        env:
+          PRED_BUDGET: '2700'     # 일봉 수신 시간 예산(초). 넘으면 시총 큰 종목부터 계산된 데까지 저장
+        run: python update_dashboard.py --pred --nobrowser
+
+      - name: ② 예측 결과 저장
+        if: steps.m.outputs.mode == 'scan' || steps.m.outputs.mode == 'pred'
+        env: { MSG: "pred" }
+        run: bash /tmp/save.sh pred.json index.html
+
+      # ③ 장중 15분마다 현재가
+      - name: ③ 현재가 갱신
+        if: steps.m.outputs.mode == 'quotes'
+        run: python update_dashboard.py --quotes --nobrowser
+
+      - name: ③ 현재가 저장
+        if: steps.m.outputs.mode == 'quotes'
+        env: { MSG: "update" }
+        run: bash /tmp/save.sh index.html live.json
 
       - name: GitHub Pages 새로 게시
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api -X POST "repos/${{ github.repository }}/pages/builds" || echo "Pages 자동 게시 요청 생략"
